@@ -1,3 +1,5 @@
+from UserDict import DictMixin
+from collections import OrderedDict
 from couchpotato.core.helpers.encoding import toUnicode
 from elixir.entity import Entity
 from elixir.fields import Field
@@ -72,34 +74,136 @@ class MutableDict(Mutable, dict):
 MutableDict.associate_with(JsonType)
 
 
-class Movie(Entity):
-    """Movie Resource a movie could have multiple releases
-    The files belonging to the movie object are global for the whole movie
+class Media(Entity):
+    """Media Resource could have multiple releases
+    The files belonging to the media object are global for the whole media
     such as trailers, nfo, thumbnails"""
 
+    type = Field(String(10), default = "movie", index = True)
     last_edit = Field(Integer, default = lambda: int(time.time()), index = True)
 
     library = ManyToOne('Library', cascade = 'delete, delete-orphan', single_parent = True)
     status = ManyToOne('Status')
     profile = ManyToOne('Profile')
+    category = ManyToOne('Category')
     releases = OneToMany('Release', cascade = 'all, delete-orphan')
     files = ManyToMany('File', cascade = 'all, delete-orphan', single_parent = True)
 
 
 class Library(Entity):
     """"""
+    using_options(inheritance = 'multi')
 
+    # For Movies, CPS uses three: omdbapi (no prio !?), tmdb (prio 2) and couchpotatoapi (prio 1)
+    type = Field(String(10), default = "movie", index = True)
+    primary_provider = Field(String(10), default = "imdb", index = True)
     year = Field(Integer)
-    identifier = Field(String(20), index = True)
+    identifier = Field(String(40), index = True)
 
     plot = Field(UnicodeText)
     tagline = Field(UnicodeText(255))
     info = Field(JsonType)
 
     status = ManyToOne('Status')
-    movies = OneToMany('Movie', cascade = 'all, delete-orphan')
+    media = OneToMany('Media', cascade = 'all, delete-orphan')
     titles = OneToMany('LibraryTitle', cascade = 'all, delete-orphan')
     files = ManyToMany('File', cascade = 'all, delete-orphan', single_parent = True)
+
+    parent = ManyToOne('Library')
+    children = OneToMany('Library')
+
+
+class ShowLibrary(Library, DictMixin):
+    using_options(inheritance = 'multi')
+
+    last_updated = Field(Integer, index = True)
+    show_status = Field(String(10), index = True)
+
+    # XXX: Maybe we should convert this to seconds?
+    # airs_time u'21:00'
+    airs_time = Field(Unicode, index = True)
+
+    # airs_dayofweek = Field(Integer, index = True)
+    #    u'Monday':    1,
+    #    u'Tuesday':   2,
+    #    u'Wednesday': 4,
+    #    u'Thursday':  8,
+    #    u'Friday':    16,
+    #    u'Saturday':  32,
+    #    u'Sunday':    64,
+    #    u'Daily':     127,
+    airs_dayofweek = Field(Integer, index = True)
+
+    def getSeasons(self):
+        data = OrderedDict()
+        for c in self.children:
+            data[c.season_number] = c
+        return data
+
+    def getEpisodes(self, season_number):
+        data = OrderedDict()
+        for c in self.children[season_number].children:
+            data[c.episode_number] = c
+        return data
+
+    # Read access to season by number: library[1] for season 1
+    data = {}
+    def __getitem__(self, key):
+        if not self.data:
+            self.setData()
+        if key in self.data:
+            return self.data[key]
+        if hasattr(self.__class__, "__missing__"):
+            return self.__class__.__missing__(self, key)
+        raise KeyError(key)
+    def get(self, key, failobj = None):
+        if key not in self:
+            return failobj
+        return self[key]
+    def keys(self): return self.data.keys()
+    def setData(self):
+        for c in self.children:
+            self.data[c.season_number] = c
+
+
+class SeasonLibrary(Library, DictMixin):
+    using_options(inheritance = 'multi')
+
+    season_number = Field(Integer, index = True)
+    last_updated = Field(Integer, index = True)
+
+    def getEpisodes(self):
+        data = OrderedDict()
+        for c in self.children:
+            data[c.episode_number] = c
+        return data
+
+    # Read access episode by number: library[1][4] for season 1, episode 4
+    data = {}
+    def __getitem__(self, key):
+        if not self.data:
+            self.setData()
+        if key in self.data:
+            return self.data[key]
+        if hasattr(self.__class__, "__missing__"):
+            return self.__class__.__missing__(self, key)
+        raise KeyError(key)
+    def get(self, key, failobj = None):
+        if key not in self:
+            return failobj
+        return self[key]
+    def keys(self): return self.data.keys()
+    def setData(self):
+        for c in self.children:
+            self.data[c.episode_number] = c
+
+
+class EpisodeLibrary(Library):
+    using_options(inheritance = 'multi')
+
+    last_updated = Field(Integer, index = True)
+    season_number = Field(Integer, index = True)
+    episode_number = Field(Integer, index = True)
 
 
 class LibraryTitle(Entity):
@@ -130,13 +234,16 @@ class Release(Entity):
     last_edit = Field(Integer, default = lambda: int(time.time()), index = True)
     identifier = Field(String(100), index = True)
 
-    movie = ManyToOne('Movie')
+    media = ManyToOne('Media')
     status = ManyToOne('Status')
     quality = ManyToOne('Quality')
     files = ManyToMany('File')
     info = OneToMany('ReleaseInfo', cascade = 'all, delete-orphan')
 
-    def to_dict(self, deep = {}, exclude = []):
+    def to_dict(self, deep = None, exclude = None):
+        if not exclude: exclude = []
+        if not deep: deep = {}
+
         orig_dict = super(Release, self).to_dict(deep = deep, exclude = exclude)
 
         new_info = {}
@@ -169,7 +276,6 @@ class Status(Entity):
     label = Field(Unicode(20))
 
     releases = OneToMany('Release')
-    movies = OneToMany('Movie')
 
 
 class Quality(Entity):
@@ -196,15 +302,33 @@ class Profile(Entity):
     core = Field(Boolean, default = False)
     hide = Field(Boolean, default = False)
 
-    movie = OneToMany('Movie')
+    media = OneToMany('Media')
     types = OneToMany('ProfileType', cascade = 'all, delete-orphan')
 
-    def to_dict(self, deep = {}, exclude = []):
+    def to_dict(self, deep = None, exclude = None):
+        if not exclude: exclude = []
+        if not deep: deep = {}
+
         orig_dict = super(Profile, self).to_dict(deep = deep, exclude = exclude)
         orig_dict['core'] = orig_dict.get('core') or False
         orig_dict['hide'] = orig_dict.get('hide') or False
 
         return orig_dict
+
+class Category(Entity):
+    """"""
+    using_options(order_by = 'order')
+
+    label = Field(Unicode(50))
+    order = Field(Integer, default = 0, index = True)
+    required = Field(Unicode(255))
+    preferred = Field(Unicode(255))
+    ignored = Field(Unicode(255))
+    destination = Field(Unicode(255))
+
+    media = OneToMany('Media')
+    destination = Field(Unicode(255))
+
 
 class ProfileType(Entity):
     """"""
@@ -229,7 +353,7 @@ class File(Entity):
     properties = OneToMany('FileProperty')
 
     history = OneToMany('RenameHistory')
-    movie = ManyToMany('Movie')
+    media = ManyToMany('Media')
     release = ManyToMany('Release')
     library = ManyToMany('Library')
 
@@ -269,13 +393,6 @@ class Notification(Entity):
     read = Field(Boolean, default = False)
     message = Field(Unicode(255))
     data = Field(JsonType)
-
-
-class Folder(Entity):
-    """Renamer destination folders."""
-
-    path = Field(Unicode(255))
-    label = Field(Unicode(255))
 
 
 class Properties(Entity):
